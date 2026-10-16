@@ -16,9 +16,15 @@ def create_app():
     from app import models  # registers models with SQLAlchemy
     from app.routes.auth import auth_bp
     from app.routes.health import health_bp
+    from app.routes.orders import orders_bp
+    from app.routes.products import products_bp
+    from app.routes.wallet import wallet_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp)
+    app.register_blueprint(products_bp)
+    app.register_blueprint(wallet_bp)
+    app.register_blueprint(orders_bp)
 
     return app
 
