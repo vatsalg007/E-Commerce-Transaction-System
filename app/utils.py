@@ -55,3 +55,11 @@ def admin_required(fn):
         return fn(*args, **kwargs)
 
     return wrapper
+
+
+
+def parse_positive_int(value):
+    number = parse_non_negative_int(value)
+    if number is None or number == 0:
+        return None
+    return number
