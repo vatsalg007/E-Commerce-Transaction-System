@@ -7,7 +7,7 @@ from sqlalchemy.orm import selectinload
 
 from app.extensions import db
 from app.models import Order, OrderItem, Product, User
-from app.utils import error, get_json_body, parse_positive_int
+from app.utils import error, get_json_body, parse_money, parse_positive_int
 
 orders_bp = Blueprint("orders", __name__)
 
@@ -67,6 +67,10 @@ def checkout():
             400,
         )
 
+    expected_total = parse_money(data.get("expected_total"))
+    if expected_total is None:
+        return error("'expected_total' must be a positive amount with at most 2 decimal places", 400)
+
     user_id = int(get_jwt_identity())
     total = Decimal("0")
     lines = []
@@ -90,7 +94,12 @@ def checkout():
         total += price * quantity
         lines.append((product_id, quantity, price))
 
-    # 2. Charge the wallet with the same guard pattern.
+    # 2. Confirm the price the user saw. The rows are still locked, so prices cannot change before commit.
+    if total != expected_total:
+        db.session.rollback()  # releases the reserved stock
+        return error("Price changed", 409, current_total=str(total))
+
+    # 3. Charge the wallet with the same guard pattern.
     new_balance = db.session.execute(
         db.update(User)
         .where(User.id == user_id, User.wallet_balance >= total)
@@ -102,7 +111,7 @@ def checkout():
         db.session.rollback()  # also releases the stock reserved above
         return error("Insufficient wallet balance", 409)
 
-    # 3. Record the order and its items at the prices just read.
+    # 4. Record the order and its items at the prices just read.
     order = Order(
         user_id=user_id,
         total_amount=total,
@@ -112,13 +121,12 @@ def checkout():
     for product_id, quantity, price in lines:
         db.session.add(OrderItem(order=order, product_id=product_id, quantity=quantity, unit_price=price))
 
-    # 4. One commit: everything above becomes permanent together.
+    # 5. One commit: everything above becomes permanent together.
     db.session.commit()
 
     response = order_to_dict(order)
     response["wallet_balance"] = str(new_balance)
     return jsonify(response), 201
-
 
 @orders_bp.route("/orders", methods=["GET"])
 @jwt_required()

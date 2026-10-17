@@ -10,8 +10,8 @@ from app.models import User
 MAX_MONEY = Decimal("100000.00")
 
 
-def error(message, status):
-    return jsonify({"error": message}), status
+def error(message, status, **extra):
+    return jsonify({"error": message, **extra}), status
 
 
 def get_json_body():
