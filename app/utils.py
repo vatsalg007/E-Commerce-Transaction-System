@@ -1,3 +1,7 @@
+import hashlib
+import json
+import uuid
+
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 
@@ -63,3 +67,18 @@ def parse_positive_int(value):
     if number is None or number == 0:
         return None
     return number
+
+def parse_idempotency_key(value):
+    """Return the canonical UUID string, or None if the value is not a valid UUID."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value.strip()))
+    except ValueError:
+        return None
+
+
+def request_fingerprint(cart, expected_total):
+    """Stable hash of the order contents, used to detect key reuse with a different request."""
+    canonical = json.dumps({"items": sorted(cart.items()), "expected_total": f"{expected_total:.2f}"})
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

@@ -30,9 +30,10 @@ class Buyer:
     start_balance: Decimal
 
 
-def api(method, path, token=None, **kwargs):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    return requests.request(method, BASE_URL + path, headers=headers, timeout=60, **kwargs)
+def api(method, path, token=None, headers=None, **kwargs):
+    merged = {"Authorization": f"Bearer {token}"} if token else {}
+    merged.update(headers or {})
+    return requests.request(method, BASE_URL + path, headers=merged, timeout=60, **kwargs)
 
 
 def expect(response, status):
@@ -60,13 +61,17 @@ def create_product(admin_token, name, price, stock):
     payload = {"name": name, "price": str(price), "stock": stock}
     return expect(api("POST", "/products", admin_token, json=payload), 201)["id"]
 
-
-def checkout(buyer, product_id, quantity, unit_price):
+def place_order(buyer, product_id, quantity, unit_price, key=None):
     payload = {
         "items": [{"product_id": product_id, "quantity": quantity}],
         "expected_total": str(unit_price * quantity),
     }
-    return api("POST", "/checkout", buyer.token, json=payload).status_code
+    headers = {"Idempotency-Key": key or str(uuid.uuid4())}
+    return api("POST", "/checkout", buyer.token, headers=headers, json=payload)
+
+
+def checkout(buyer, product_id, quantity, unit_price):
+    return place_order(buyer, product_id, quantity, unit_price).status_code
 
 
 def get_stock(product_id):
@@ -156,12 +161,88 @@ def wallet_race(admin_token, run_id):
     orders = count_orders(buyer)
     check(f"exactly {affordable} orders exist (got {orders})", orders == affordable)
 
+def is_replay(response):
+    return response.headers.get("Idempotent-Replayed") == "true"
+
+
+def duplicate_race(admin_token, run_id):
+    duplicates, price, balance, stock = 20, Decimal("100.00"), Decimal("500.00"), 10
+    print(f"\nScenario C: one user, {duplicates} simultaneous submissions with the same Idempotency-Key")
+
+    product_id = create_product(admin_token, f"Stress C {run_id}", price, stock)
+    buyer = create_buyer(f"stress_{run_id}_c@test.com", balance)
+    key = str(uuid.uuid4())
+
+    job = partial(place_order, buyer, product_id, 1, price, key)
+    responses = run_in_parallel([job] * duplicates)
+
+    counts = Counter(r.status_code for r in responses)
+    replays = sum(1 for r in responses if is_replay(r))
+    check(f"all {duplicates} responses are 201 (got {dict(counts)})", counts[201] == duplicates)
+    check(f"exactly 1 request created the order, {duplicates - 1} were replays (replays: {replays})",
+          replays == duplicates - 1)
+
+    order_ids = {r.json()["order_id"] for r in responses if r.status_code == 201}
+    check(f"all responses point to the same order (got {order_ids})", len(order_ids) == 1)
+
+    final_balance = get_balance(buyer)
+    check(f"charged exactly once: balance is {balance - price} (got {final_balance})",
+          final_balance == balance - price)
+    final_stock = get_stock(product_id)
+    check(f"stock reduced exactly once: {stock - 1} (got {final_stock})", final_stock == stock - 1)
+    orders = count_orders(buyer)
+    check(f"exactly 1 order exists (got {orders})", orders == 1)
+
+    misuse = place_order(buyer, product_id, 2, price, key)
+    check(f"same key with a different cart is rejected (422: {misuse.status_code})", misuse.status_code == 422)
+    check("balance unchanged after the misuse attempt", get_balance(buyer) == balance - price)
+
+
+def stored_failure(admin_token, run_id):
+    price, start_balance, topup, stock = Decimal("100.00"), Decimal("50.00"), Decimal("500.00"), 10
+    print("\nScenario D: a definitive failure is stored under its key")
+
+    product_id = create_product(admin_token, f"Stress D {run_id}", price, stock)
+    buyer = create_buyer(f"stress_{run_id}_d@test.com", start_balance)
+    key = str(uuid.uuid4())
+
+    first = place_order(buyer, product_id, 1, price, key)
+    check(f"first attempt is rejected for low balance (409: {first.status_code})", first.status_code == 409)
+    check("the first rejection is not flagged as a replay", not is_replay(first))
+    check(f"rejected attempt took no stock (got {get_stock(product_id)})", get_stock(product_id) == stock)
+
+    expect(api("POST", "/wallet/topup", buyer.token, json={"amount": str(topup)}), 200)
+
+    retry = place_order(buyer, product_id, 1, price, key)
+    check(f"same key replays the stored 409 even though the wallet now covers it (got {retry.status_code})",
+          retry.status_code == 409 and is_replay(retry))
+    check("no order was created by the replay", count_orders(buyer) == 0)
+
+    fresh = place_order(buyer, product_id, 1, price)
+    check(f"a new key runs the purchase (201: {fresh.status_code})", fresh.status_code == 201)
+    expected_balance = start_balance + topup - price
+    check(f"balance is exactly {expected_balance} (got {get_balance(buyer)})",
+          get_balance(buyer) == expected_balance)
+    check(f"stock reduced once: {stock - 1} (got {get_stock(product_id)})", get_stock(product_id) == stock - 1)
+    check("exactly 1 order exists", count_orders(buyer) == 1)
+
+SCENARIOS = {
+    "A": stock_race,
+    "B": wallet_race,
+    "C": duplicate_race,
+    "D": stored_failure,
+}
 
 def main():
+    selected = [name.upper() for name in sys.argv[1:]] or list(SCENARIOS)
+    unknown = [name for name in selected if name not in SCENARIOS]
+    if unknown:
+        sys.exit(f"Unknown scenario(s): {', '.join(unknown)}. Choose from: {', '.join(SCENARIOS)}")
+
     run_id = uuid.uuid4().hex[:8]
     admin_token = login(ADMIN_EMAIL, ADMIN_PASSWORD)
-    stock_race(admin_token, run_id)
-    wallet_race(admin_token, run_id)
+    for name in selected:
+        SCENARIOS[name](admin_token, run_id)
 
     print()
     if failures:

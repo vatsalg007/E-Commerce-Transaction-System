@@ -1,18 +1,42 @@
-import uuid
+
 from decimal import Decimal
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 from flask_jwt_extended import get_jwt_identity, jwt_required
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import selectinload
 
 from app.extensions import db
-from app.models import Order, OrderItem, Product, User
-from app.utils import error, get_json_body, parse_money, parse_positive_int
+from app.models import IdempotencyKey, Order, OrderItem, Product, User
+from app.utils import (
+    error,
+    get_json_body,
+    parse_idempotency_key,
+    parse_money,
+    parse_positive_int,
+    request_fingerprint,
+)
 
 orders_bp = Blueprint("orders", __name__)
 
 MAX_LINES_PER_ORDER = 20
 MAX_QUANTITY_PER_PRODUCT = 100
+
+
+class CheckoutRejected(Exception):
+    """A definitive business failure (stock, price, wallet). Its response is stored under the key."""
+
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body
+
+
+def json_response(body, status, replayed=False):
+    response = jsonify(body)
+    response.status_code = status
+    if replayed:
+        response.headers["Idempotent-Replayed"] = "true"
+    return response
 
 
 def order_to_dict(order):
@@ -52,6 +76,74 @@ def parse_cart(data):
     return cart
 
 
+def replay(user_id, idempotency_key, fingerprint):
+    """Return the stored response for this key, or a 422 if the request differs."""
+    record = db.session.scalars(
+        db.select(IdempotencyKey).where(
+            IdempotencyKey.user_id == user_id,
+            IdempotencyKey.idempotency_key == idempotency_key,
+        )
+    ).one()
+
+    if record.request_hash != fingerprint:
+        return error("Idempotency-Key was already used with a different request", 422)
+
+    return json_response(record.response_body, record.response_code, replayed=True)
+
+
+def execute_checkout(user_id, cart, expected_total):
+    """Reserve stock, confirm the price, charge the wallet and create the order.
+
+    Returns the response body. Raises CheckoutRejected on a definitive failure.
+    """
+    total = Decimal("0")
+    lines = []
+
+    # 1. Reserve stock. Sorted ids: every checkout locks rows in the same order, so no deadlocks.
+    for product_id in sorted(cart):
+        quantity = cart[product_id]
+        price = db.session.execute(
+            db.update(Product)
+            .where(Product.id == product_id, Product.stock >= quantity)  # the guard
+            .values(stock=Product.stock - quantity)
+            .returning(Product.price)
+        ).scalar_one_or_none()
+
+        if price is None:
+            if db.session.get(Product, product_id) is None:
+                raise CheckoutRejected(404, {"error": f"Product {product_id} not found"})
+            raise CheckoutRejected(409, {"error": f"Insufficient stock for product {product_id}"})
+
+        total += price * quantity
+        lines.append((product_id, quantity, price))
+
+    # 2. Confirm the price the user saw. The rows are still locked, so prices cannot change before commit.
+    if total != expected_total:
+        raise CheckoutRejected(409, {"error": "Price changed", "current_total": str(total)})
+
+    # 3. Charge the wallet with the same guard pattern.
+    new_balance = db.session.execute(
+        db.update(User)
+        .where(User.id == user_id, User.wallet_balance >= total)
+        .values(wallet_balance=User.wallet_balance - total)
+        .returning(User.wallet_balance)
+    ).scalar_one_or_none()
+
+    if new_balance is None:
+        raise CheckoutRejected(409, {"error": "Insufficient wallet balance"})
+
+    # 4. Record the order and its items at the prices just read.
+    order = Order(user_id=user_id, total_amount=total)
+    db.session.add(order)
+    for product_id, quantity, price in lines:
+        db.session.add(OrderItem(order=order, product_id=product_id, quantity=quantity, unit_price=price))
+    db.session.flush()
+
+    body = order_to_dict(order)
+    body["wallet_balance"] = str(new_balance)
+    return body
+
+
 @orders_bp.route("/checkout", methods=["POST"])
 @jwt_required()
 def checkout():
@@ -71,62 +163,46 @@ def checkout():
     if expected_total is None:
         return error("'expected_total' must be a positive amount with at most 2 decimal places", 400)
 
+    idempotency_key = parse_idempotency_key(request.headers.get("Idempotency-Key"))
+    if idempotency_key is None:
+        return error("'Idempotency-Key' header with a valid UUID is required", 400)
+
     user_id = int(get_jwt_identity())
-    total = Decimal("0")
-    lines = []
+    fingerprint = request_fingerprint(cart, expected_total)
 
-    # 1. Reserve stock. Sorted ids: every checkout locks rows in the same order, so no deadlocks.
-    for product_id in sorted(cart):
-        quantity = cart[product_id]
-        price = db.session.execute(
-            db.update(Product)
-            .where(Product.id == product_id, Product.stock >= quantity)  # the guard
-            .values(stock=Product.stock - quantity)
-            .returning(Product.price)
-        ).scalar_one_or_none()
-
-        if price is None:
-            db.session.rollback()  # undo any stock already reserved
-            if db.session.get(Product, product_id) is None:
-                return error(f"Product {product_id} not found", 404)
-            return error(f"Insufficient stock for product {product_id}", 409)
-
-        total += price * quantity
-        lines.append((product_id, quantity, price))
-
-    # 2. Confirm the price the user saw. The rows are still locked, so prices cannot change before commit.
-    if total != expected_total:
-        db.session.rollback()  # releases the reserved stock
-        return error("Price changed", 409, current_total=str(total))
-
-    # 3. Charge the wallet with the same guard pattern.
-    new_balance = db.session.execute(
-        db.update(User)
-        .where(User.id == user_id, User.wallet_balance >= total)
-        .values(wallet_balance=User.wallet_balance - total)
-        .returning(User.wallet_balance)
+    # 0. Claim the key. A concurrent request with the same key waits here until this
+    #    transaction commits or rolls back, so only one request can proceed.
+    key_id = db.session.execute(
+        pg_insert(IdempotencyKey)
+        .values(user_id=user_id, idempotency_key=idempotency_key, request_hash=fingerprint)
+        .on_conflict_do_nothing(index_elements=["user_id", "idempotency_key"])
+        .returning(IdempotencyKey.id)
     ).scalar_one_or_none()
 
-    if new_balance is None:
-        db.session.rollback()  # also releases the stock reserved above
-        return error("Insufficient wallet balance", 409)
+    if key_id is None:  # key already used by a committed request
+        db.session.rollback()  # ends the empty transaction
+        return replay(user_id, idempotency_key, fingerprint)
 
-    # 4. Record the order and its items at the prices just read.
-    order = Order(
-        user_id=user_id,
-        total_amount=total,
-        idempotency_key=str(uuid.uuid4()),  # placeholder until Phase 10
-    )
-    db.session.add(order)
-    for product_id, quantity, price in lines:
-        db.session.add(OrderItem(order=order, product_id=product_id, quantity=quantity, unit_price=price))
+    # 1-4. The work runs inside a savepoint. A definitive failure rolls back to it, which undoes
+    #      stock and wallet changes but keeps the key row. Any other exception is a transient
+    #      failure: it propagates, and the whole transaction, including the claim, is rolled back.
+    try:
+        with db.session.begin_nested():
+            body = execute_checkout(user_id, cart, expected_total)
+        status = 201
+    except CheckoutRejected as rejection:
+        status, body = rejection.status, rejection.body
 
-    # 5. One commit: everything above becomes permanent together.
+
+    # 5. Store the outcome on the key and commit once: claim, outcome and (on success) stock,
+    #    wallet, order and items become permanent together.
+    record = db.session.get(IdempotencyKey, key_id)
+    record.response_code = status
+    record.response_body = body
     db.session.commit()
 
-    response = order_to_dict(order)
-    response["wallet_balance"] = str(new_balance)
-    return jsonify(response), 201
+    return json_response(body, status)
+
 
 @orders_bp.route("/orders", methods=["GET"])
 @jwt_required()

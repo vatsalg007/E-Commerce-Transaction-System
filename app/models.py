@@ -33,14 +33,10 @@ class Product(db.Model):
 
 class Order(db.Model):
     __tablename__ = "orders"
-    __table_args__ = (
-        UniqueConstraint("user_id", "idempotency_key", name="uq_orders_user_idempotency_key"),
-    )
 
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     total_amount = db.Column(db.Numeric(12, 2), nullable=False)
-    idempotency_key = db.Column(db.String(100), nullable=False)
     created_at = db.Column(db.DateTime, nullable=False, server_default=db.func.now())
 
     items = db.relationship("OrderItem", backref="order")
@@ -59,3 +55,18 @@ class OrderItem(db.Model):
     unit_price = db.Column(db.Numeric(12, 2), nullable=False)
 
     product = db.relationship("Product")
+
+
+class IdempotencyKey(db.Model):
+    __tablename__ = "idempotency_keys"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_idempotency_keys_user_key"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    idempotency_key = db.Column(db.String(36), nullable=False)
+    request_hash = db.Column(db.String(64), nullable=False)
+    response_code = db.Column(db.Integer)  # filled in before the transaction commits
+    response_body = db.Column(db.JSON)  # filled in before the transaction commits
+    created_at = db.Column(db.DateTime, nullable=False, server_default=db.func.now())
