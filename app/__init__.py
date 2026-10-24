@@ -3,7 +3,7 @@ from flask import Flask
 from app.config import Config
 from app.extensions import db, jwt
 from app.utils import error
-
+from app.routes.docs import docs_bp
 
 def create_app():
     app = Flask(__name__)
@@ -19,7 +19,8 @@ def create_app():
     from app.routes.orders import orders_bp
     from app.routes.products import products_bp
     from app.routes.wallet import wallet_bp
-
+    
+    app.register_blueprint(docs_bp)
     app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(products_bp)
